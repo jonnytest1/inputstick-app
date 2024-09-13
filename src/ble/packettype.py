@@ -2,15 +2,21 @@ from enum import Enum
 
 
 class Packet_Type(Enum):
+    TRANSACTION_CMD_DEFAULT = 0
     START_TAG = 0x55
     FLAG_RESPOND = 0x80
 
     FLAG_ENCRYPTED = 0x40
     CMD_RUN_FW = 0x04
+    CMD_GET_INFO = 5
     CMD_FW_INFO = 16
     CMD_INIT = 17
     CMD_INIT_AUTH = 18
     CMD_HID_DATA_RAW = 39
+
+    CMD_HID_DATA_KEYB = 33
+    CMD_HID_DATA_KEYB_FAST = 44
+
     CMD_INIT_AUTH_HMAC = 48
     CMD_SET_UPDATE_INTERVAL = 49
     CMD_HID_STATUS = 47

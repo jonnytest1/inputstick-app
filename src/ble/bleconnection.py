@@ -1,18 +1,19 @@
 import asyncio
 from datetime import datetime, timedelta
 from enum import Enum
+import traceback
 from typing import Union
 from bleak import BleakClient
 from bleak.backends.service import BleakGATTService
 from bleak.backends.characteristic import BleakGATTCharacteristic
 
-from hidinfo import HidInfo
-from deviceinfo import DeviceInfo
-from packet import Packet
+from ble.inputstick_hid import InputStickHID
+from ble.deviceinfo import DeviceInfo
+from ble.packet import Packet
 
-from packettype import Packet_Type
-from crc import Crc
-from event import ConcreteSubject, Subject
+from ble.packettype import Packet_Type
+from ble.crc import Crc
+from ble.event import ConcreteSubject, Subject
 from binascii import crc32
 UUID_NRF_RX = "6e400003-b5a3-f393-e0a9-e50e24dcca9e"
 UUID_NRF_TX = "6e400002-b5a3-f393-e0a9-e50e24dcca9e"
@@ -45,11 +46,10 @@ class PacketService():
 
     m_key: Union[bytearray, None] = None
 
-    hid_info = HidInfo()
+    inputstick_hid = InputStickHID()
 
     def __init__(self, con_ref: "BLEConnection") -> None:
         self.con_ref = con_ref
-        pass
 
     def to_packet(self, data: bytearray):
         payload = data[2:]
@@ -75,13 +75,13 @@ class PacketService():
             if packet is None:
                 print("got not mathcing packet")
             else:
-
+                self.inputstick_hid.on_rx_data(data)
                 cmd = packet[0]
                 resp_code = packet[1]
                 param = packet[1]
                 try:
-                    if cmd != Packet_Type.CMD_HID_STATUS.value:
-                        print(f"{cmd} for {Packet_Type(cmd)}")
+                    # if cmd != Packet_Type.CMD_HID_STATUS.value:
+                    print(f"{cmd} for {Packet_Type(cmd)}")
                 except ValueError:
                     print(f"{cmd} for unmatched")
 
@@ -102,13 +102,17 @@ class PacketService():
                             self.con_ref.send_packet(
                                 Packet(True, Packet_Type.CMD_SET_UPDATE_INTERVAL, 5))
                         else:
-                            self.con_ref.set_Status_interval(100)
+                            self.con_ref.set_status_interval(100)
                     else:
                         print("failed init")
-
+                elif cmd == Packet_Type.CMD_SET_UPDATE_INTERVAL.value:
+                    print("updating status interval")
+                    if resp_code == Packet_Type.RESP_OK.value:
+                        self.con_ref.set_status_interval(500)
                 elif cmd == Packet_Type.CMD_HID_STATUS.value:
                     if self.m_key is None:
                         self.con_ref.init_done = True
+
                     if self.con_ref.init_done:
                         if param != self.con_ref.last_status_param:
                             self.con_ref.last_status_param = param
@@ -116,7 +120,6 @@ class PacketService():
                                 self.con_ref.on_ready()
                             else:
                                 self.con_ref.not_ready()
-                    self.hid_info.update(data)
 
     def on_fw_info(self, data: bytearray, check_auth, enc, next: Packet):
         self.device_info = DeviceInfo(data)
@@ -137,7 +140,6 @@ class PacketService():
 
     def on_byte_rx(self, bytes: bytearray):
         finished_command = False
-        print(f"got rx {list(bytes)}")
         for byte in bytes:
             time = datetime.now()
             if time > self.last_rx_time+self.RX_TIMEOUT and False:
@@ -181,7 +183,6 @@ class PacketService():
 
 class BLEConnection:
     tx_buffer: list[bytearray] = []
-    can_send = False
     last_rx_time = datetime.fromtimestamp(0)
 
     connection_status = ConcreteSubject()
@@ -200,9 +201,10 @@ class BLEConnection:
     status_update_interval = 0
     packet_service: PacketService
 
-    def __init__(self, client: BleakClient, service: BleakGATTService) -> None:
+    def __init__(self, client: BleakClient, service: BleakGATTService, loop: asyncio.AbstractEventLoop) -> None:
         self.client = client
         self.service = service
+        self.loop = loop
 
         rx = service.get_characteristic(UUID_NRF_RX)
         if rx is None:
@@ -216,6 +218,8 @@ class BLEConnection:
         print("connecting")
         self.connection_status.update(CON_STATE.CONNECTING)
         self.packet_service = PacketService(self)
+        self.send_next_loops: list[str] = []
+        self.send_next_lock = asyncio.Lock()
 
     async def init(self):
         if self.rx is not None:
@@ -231,10 +235,12 @@ class BLEConnection:
                 print("written descriptor")
 
             self.last_rx_time = datetime.now()
-            self.can_send = True
-            await self.send_next()
-            await self.on_connected()
-            print("connected")
+            await self.send_next("after init")
+            sucessful = await self.on_connected()
+            if sucessful:
+                print("connected")
+            return sucessful
+        return False
 
     async def on_connected(self):
         self.connection_status.update(CON_STATE.CONNECTED)
@@ -243,18 +249,26 @@ class BLEConnection:
 
         self.send_packet(Packet(True, Packet_Type.CMD_RUN_FW))
 
-        await asyncio.sleep(1000)
+        await asyncio.sleep(2)
         if not self.init_done:
             print("reinit after timeout")
             self.send_packet(Packet(True, Packet_Type.CMD_RUN_FW))
+        else:
+            return True
 
-        await asyncio.sleep(1000)
+        await asyncio.sleep(5)
+        if not self.init_done:
+            print("reinit after timeout 2")
+            self.send_packet(Packet(True, Packet_Type.CMD_RUN_FW))
+        else:
+            return True
+        await asyncio.sleep(1)
         if not self.init_done:
             print("second init failed")
             return False
         return True
 
-    def set_Status_interval(self, interval: int):
+    def set_status_interval(self, interval: int):
         self.status_update_interval = interval
 
         self.last_rx_time = datetime.now()
@@ -264,12 +278,13 @@ class BLEConnection:
 
     def send_packet(self, packet: Packet):
         data = packet.get_bytes()
-        length = len(data)+CRC_OFFSET
+        data_len = len(data)
+        length = data_len+CRC_OFFSET
         packets = ((length - 1) >> 4) + 1
 
         result = bytearray(packets * self.PACKET_SIZE)
 
-        result[4:4+len(data)] = data
+        result[4:4+data_len] = data
 
         self.crc.reset()
         self.crc.update(result, CRC_OFFSET, len(result) - CRC_OFFSET)
@@ -313,7 +328,7 @@ class BLEConnection:
             else:
                 tmp = bytearray(16)
 
-            tmp[offset:16] = data
+            tmp[offset:offset+16] = data
             self.tx_buffer.append(tmp)
         else:
             print("!! no txBuffer")
@@ -334,49 +349,72 @@ class BLEConnection:
                 offset += 16
                 self.add_data_16(tmp)
 
-            asyncio.create_task(self.send_next())
+            self.loop.create_task(self.send_next("after write"))
 
     def on_rx(self, c: BleakGATTCharacteristic, data: bytearray):
         finished_rx = self.packet_service.on_byte_rx(data)
         if finished_rx:
             self.last_rx_time = datetime.now()
-            asyncio.create_task(self.send_next())
+            if len(self.tx_buffer) > 0:
+                self.loop.create_task(self.send_next("on rx"))
 
     def get_data(self):
         if len(self.tx_buffer) > 0:
             return self.tx_buffer.pop(0)
         return None
 
-    async def send_next(self):
+    async def send_next(self, loop_reason: str, loop_index: int = -1):
+
+        if loop_index == -1:
+            loop_index = len(self.send_next_loops)
+            self.send_next_loops.append(loop_reason)
         time = datetime.now().timestamp()
 
         if ((self.status_update_interval > 0) and (time > (self.last_rx_time.timestamp() + self.status_update_interval - 45))):
-            print("abort for status update")
+            self.send_next_loops[loop_index] = ""
+            print(f"abort for status update {loop_index} {loop_reason}")
+            print(self.send_next_loops)
             return
 
         # status interval check
+        if self.send_next_lock.locked():
+            print(f"aborting lock {loop_reason}")
+            return
 
-        if self.can_send:
-            data = self.get_data()
-            if data is not None:
-                self.can_send = False
-                r1 = False
-                r2 = False
-                print(f"writing data {list(data)}")
-                r1 = await self.client.write_gatt_char(self.tx, data, response=False)
-                print("writing done")
-                self.can_send = True
-                self.last_rx_time = datetime.now()
-                await self.send_next()
+        data = self.get_data()
+        if data is not None:
+            print(f"got data in {loop_reason}")
 
-            else:
-                # print("no data")
-                pass
+            try:
+                await asyncio.wait_for(self.send_next_lock.acquire(), timeout=1)
+            except Exception as e:
+                print("got timeout")
+                return
+            print(f"{datetime.now().isoformat()} writing data {
+                list(data)} ({len(data)})")
+
+            # if len(self.tx_buffer) > 0:
+            # asyncio.create_task(self.send_next())
+            try:
+                await asyncio.wait_for(self.client.write_gatt_char(
+                    self.tx, data, response=False), timeout=5)
+            except Exception as e:
+                self.send_next_lock.release()
+                self.send_next_loops[loop_index] = ""
+                print(traceback.format_exc(), f"{loop_reason}")
+                raise e
+            self.send_next_lock.release()
+            print(f"{datetime.now().isoformat()} writing done")
+            self.last_rx_time = datetime.now()
+            await self.send_next(loop_reason+"->", loop_index)
         else:
-            pass
-            # print("cant send")
+            self.send_next_loops[loop_index] = ""
+            print(f"no data {loop_index} {loop_reason}")
+            print(self.send_next_loops)
 
     def on_ready(self):
+        print("switch to ready")
+        self.send_next_loops = []
         self.connection_status.update(CON_STATE.READY)
 
     def not_ready(self):

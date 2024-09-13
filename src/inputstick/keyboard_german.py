@@ -1,4 +1,7 @@
-FAST = LUT = [
+
+from keyboardlayout import type
+
+FAST_LUT = [
     [0, 0, 0, 0, 0],
     [10, 0, 40, 0, 0],  # enter
     [9, 0, 43, 0, 0],
@@ -143,3 +146,11 @@ FAST = LUT = [
     [252, 0, 47, 0, 0],
     [253, 0, 29, 0, 46],
     [8364, 64, 8, 0, 0]]
+
+
+class GermanLayout():
+
+    async def type(con, text: str):
+        # await type(con, FAST_LUT, text, mods)
+
+        pass

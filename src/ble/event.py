@@ -1,4 +1,7 @@
 
+from typing import Callable
+
+
 class Observer:
     def update(self, subject: "Subject"):
         """Receive update from the subject."""
@@ -12,6 +15,13 @@ class Subject:
     def attach(self, observer: Observer):
         """Attach an observer to the subject."""
         self._observers.append(observer)
+
+    def on_emit(self, fnc: "Callable[[Subject],None]"):
+
+        class OImple(Observer):
+            def update(self, subject: "Subject"):
+                fnc(subject)
+        self.attach(OImple())
 
     def detach(self, observer: Observer):
         """Detach an observer from the subject."""
